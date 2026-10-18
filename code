@@ -1,0 +1,216 @@
+/*
+ * TikTok Repost Temizleyici
+ * --------------------------------------------------------------
+ * Kullanım:
+ *   1) Chrome'da tiktok.com'a giriş yap ve kendi profilini aç.
+ *   2) Konsolu aç: Mac'te Cmd + Option + J  (Windows'ta Ctrl + Shift + J)
+ *   3) Chrome yapıştırmaya izin vermezse konsola  allow pasting  yazıp Enter'a bas.
+ *   4) Bu kodun tamamını yapıştır, Enter'a bas, çıkan onay penceresine "Tamam" de.
+ *   Durdurmak için: sağ alttaki "Durdur" butonu  ya da konsola  window.__stopReposts = true
+ *
+ * Sadece GİRİŞ YAPMIŞ hesabın repostlarını kaldırır. Resmi olmayan bir yöntemdir;
+ * TikTok sitesini değiştirirse çalışmayı bırakabilir.
+ */
+(async () => {
+  // ---- Ayarlar ----------------------------------------------------------
+  const DELAY_MIN_MS = 1200;   // iki kaldırma arası en az bekleme
+  const DELAY_MAX_MS = 2500;   // iki kaldırma arası en fazla bekleme
+  const PAGE_PAUSE_MS = 3000;  // her 30'luk grup sonrası bekleme
+  const RATE_LIMIT_WAIT_MS = 60000; // TikTok "yavaşla" derse bekleme
+  const MAX_CONSECUTIVE_FAILS = 5;  // üst üste bu kadar hata olursa durur
+  const MAX_ATTEMPTS_PER_ITEM = 2;  // bir videoyu en fazla kaç kez denesin
+  // -----------------------------------------------------------------------
+
+  if (window.__repostCleanerRunning) {
+    console.warn('Repost temizleyici zaten çalışıyor.');
+    return;
+  }
+  window.__repostCleanerRunning = true;
+  window.__stopReposts = false;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => Math.round(a + Math.random() * (b - a));
+
+  // ---- Küçük durum paneli ---------------------------------------------
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position: 'fixed', right: '16px', bottom: '16px', zIndex: 2147483647,
+    background: '#111', color: '#fff', padding: '12px 14px', borderRadius: '10px',
+    font: '13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif',
+    boxShadow: '0 4px 16px rgba(0,0,0,.4)', maxWidth: '300px',
+  });
+  const title = document.createElement('div');
+  title.textContent = 'Repost temizleyici';
+  title.style.fontWeight = '600';
+  const statusEl = document.createElement('div');
+  statusEl.style.margin = '6px 0 8px';
+  const stopBtn = document.createElement('button');
+  stopBtn.textContent = 'Durdur';
+  Object.assign(stopBtn.style, {
+    background: '#fe2c55', color: '#fff', border: 0, borderRadius: '6px',
+    padding: '6px 12px', cursor: 'pointer', font: 'inherit',
+  });
+  stopBtn.onclick = () => { window.__stopReposts = true; setStatus('Durduruluyor…'); };
+  panel.append(title, statusEl, stopBtn);
+  document.body.appendChild(panel);
+
+  let removed = 0;
+  const setStatus = (msg) => {
+    statusEl.textContent = `Kaldırılan: ${removed}  •  ${msg}`;
+  };
+  const finish = (msg) => {
+    setStatus(msg);
+    stopBtn.textContent = 'Kapat';
+    stopBtn.onclick = () => panel.remove();
+    window.__repostCleanerRunning = false;
+    console.log(`%c[Repost temizleyici] ${msg} Toplam kaldırılan: ${removed}`, 'color:#25f4ee;font-weight:bold');
+  };
+
+  // ---- Oturum bilgisi ---------------------------------------------------
+  function getAppContext() {
+    let data = window.__$UNIVERSAL_DATA$__;
+    if (!data || !data.__DEFAULT_SCOPE__) {
+      const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+      if (el) { try { data = JSON.parse(el.textContent); } catch (_) { /* yok say */ } }
+    }
+    return (data && data.__DEFAULT_SCOPE__ && data.__DEFAULT_SCOPE__['webapp.app-context']) || null;
+  }
+
+  const ctx = getAppContext();
+  const secUid = ctx && ctx.user && ctx.user.secUid;
+  const username = ctx && ctx.user && ctx.user.uniqueId;
+  if (!secUid) {
+    finish('Giriş yapılmış hesap bulunamadı. tiktok.com\'a giriş yapıp sayfayı yenile, sonra tekrar dene.');
+    return;
+  }
+  const cookieCsrf = (document.cookie.match(/(?:^|;\s*)tt_csrf_token=([^;]+)/) || [])[1];
+  const csrfToken = ctx.csrfToken || cookieCsrf || '';
+
+  // ---- TikTok istekleri -------------------------------------------------
+  async function listReposts(cursor) {
+    const params = new URLSearchParams({
+      aid: '1988', count: '30', coverFormat: '2', cursor: String(cursor),
+      needPinnedItemIds: 'true', post_item_list_request_type: '0', secUid,
+    });
+    const res = await fetch('/api/repost/item_list/?' + params, {
+      credentials: 'same-origin', headers: { accept: '*/*' },
+    });
+    if (res.status === 429) return { rateLimited: true };
+    if (res.status === 401 || res.status === 403) throw new Error('Oturum reddedildi (HTTP ' + res.status + ')');
+    if (!res.ok) throw new Error('Liste alınamadı (HTTP ' + res.status + ')');
+    const text = await res.text();
+    if (!text || !text.trim()) return { items: [], hasMore: false, cursor };
+    const json = JSON.parse(text);
+    if (json.status_code && json.status_code !== 0) {
+      throw new Error('Liste hatası: ' + json.status_code + ' ' + (json.status_msg || ''));
+    }
+    return { items: json.itemList || [], hasMore: !!json.hasMore, cursor: json.cursor };
+  }
+
+  async function removeRepost(itemId) {
+    const params = new URLSearchParams({ aid: '1988', item_id: String(itemId) });
+    const headers = { accept: '*/*', 'content-type': 'application/x-www-form-urlencoded' };
+    if (csrfToken) headers['tt-csrf-token'] = csrfToken;
+    const res = await fetch('/tiktok/v1/upvote/delete?' + params, {
+      method: 'POST', headers, body: '', credentials: 'same-origin',
+    });
+    if (res.status === 429) return { ok: false, rateLimited: true };
+    if (res.status === 401 || res.status === 403) return { ok: false, sessionRejected: true };
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+    const text = await res.text();
+    if (!text || !text.trim()) return { ok: true };
+    try {
+      const json = JSON.parse(text);
+      return json.status_code === 0
+        ? { ok: true }
+        : { ok: false, error: json.status_code + ' ' + (json.status_msg || '') };
+    } catch (_) {
+      return { ok: false, error: 'Beklenmeyen yanıt' };
+    }
+  }
+
+  // ---- Ana döngü --------------------------------------------------------
+  const removedIds = new Set();
+  const attempts = new Map();
+
+  // Henüz kaldırılmamış ve deneme hakkı kalmış repostları bulur
+  async function findWork() {
+    let cursor = 0;
+    for (let i = 0; i < 200; i++) {
+      if (window.__stopReposts) return [];
+      const page = await listReposts(cursor);
+      if (page.rateLimited) {
+        setStatus('TikTok yavaşlamamızı istedi, 60 sn bekleniyor…');
+        await sleep(RATE_LIMIT_WAIT_MS);
+        continue;
+      }
+      const todo = page.items.filter(
+        (it) => it && it.id && !removedIds.has(it.id) && (attempts.get(it.id) || 0) < MAX_ATTEMPTS_PER_ITEM
+      );
+      if (todo.length) return todo;
+      if (!page.hasMore) return [];
+      cursor = page.cursor;
+      await sleep(800);
+    }
+    return [];
+  }
+
+  if (!confirm(`@${username || 'hesabın'} hesabındaki TÜM repostlar kaldırılacak. Devam edilsin mi?`)) {
+    finish('İptal edildi.');
+    return;
+  }
+
+  console.log(`%c[Repost temizleyici] @${username} için başladı.`, 'color:#25f4ee;font-weight:bold');
+  let consecutiveFails = 0;
+  let failedTotal = 0;
+
+  try {
+    outer: while (!window.__stopReposts) {
+      setStatus('Repostlar listeleniyor…');
+      const batch = await findWork();
+      if (!batch.length) break;
+
+      for (const it of batch) {
+        if (window.__stopReposts) break outer;
+        attempts.set(it.id, (attempts.get(it.id) || 0) + 1);
+        const who = (it.author && it.author.uniqueId) ? '@' + it.author.uniqueId : '';
+        const desc = (it.desc || '').slice(0, 50);
+
+        const r = await removeRepost(it.id);
+        if (r.ok) {
+          removed++;
+          removedIds.add(it.id);
+          consecutiveFails = 0;
+          console.log(`✅ ${removed}. ${who} ${desc}`);
+          setStatus('Çalışıyor…');
+        } else if (r.sessionRejected) {
+          throw new Error('Oturum reddedildi. Sayfayı yenileyip tekrar dene.');
+        } else {
+          consecutiveFails++;
+          failedTotal++;
+          if (r.rateLimited) {
+            console.warn('⏳ Hız sınırı. 60 sn bekleniyor…');
+            setStatus('TikTok yavaşlamamızı istedi, 60 sn bekleniyor…');
+            await sleep(RATE_LIMIT_WAIT_MS);
+          } else {
+            console.warn(`⚠️ Kaldırılamadı (${r.error}): ${who} ${desc}`);
+          }
+          if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+            throw new Error(`Üst üste ${MAX_CONSECUTIVE_FAILS} hata oldu, güvenlik için durduruldu. Birkaç dakika sonra tekrar çalıştır.`);
+          }
+        }
+        await sleep(rand(DELAY_MIN_MS, DELAY_MAX_MS));
+      }
+      await sleep(PAGE_PAUSE_MS);
+    }
+  } catch (e) {
+    console.error('[Repost temizleyici]', e);
+    finish('Durdu: ' + e.message);
+    return;
+  }
+
+  const stuck = [...attempts.keys()].filter((id) => !removedIds.has(id)).length;
+  if (window.__stopReposts) finish('Sen durdurdun.');
+  else if (stuck) finish(`Bitti. ${stuck} repost kaldırılamadı; birkaç dakika sonra scripti tekrar çalıştır.`);
+  else finish('Bitti! Kaldırılacak repost kalmadı.');
+})();
